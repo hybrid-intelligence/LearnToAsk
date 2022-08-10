@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from builder.dataloader_with_glove import BuilderDataset, RawInputs
-
+import pdb
 sys.path.append('..')
 from utils import *
 
@@ -27,8 +27,14 @@ class Builder(nn.Module):
 
     def forward(self, encoder_inputs, grid_repr_inputs, action_repr_inputs, label, location_mask=None, raw_input=None, dataset=None):
         dialogue_repr = self.encoder(encoder_inputs)
+        pdb.set_trace()
         loss, acc, predicted_seq = self.decoder(dialogue_repr, grid_repr_inputs, action_repr_inputs, label, location_mask, raw_input, dataset)
         return loss, acc, predicted_seq
+
+    def forward_one_step(self, encoder_inputs, grid_repr_inputs, action_repr_inputs, location_mask=None, raw_input=None, dataset=None):
+        dialogue_repr = self.encoder(encoder_inputs)
+        location_logits, action_type_logits, color_logits = self.decoder._get_logits(dialogue_repr, grid_repr_inputs, action_repr_inputs, location_mask=location_mask)
+        return location_logits, action_type_logits, color_logits
 
 
 class UtteranceEncoder(nn.Module):
@@ -167,7 +173,6 @@ class ActionDecoder(nn.Module):
                 location_logits, action_type_logits, color_logits = self._get_logits(utter_vec, world_repr[:,k], last_action[:,k], location_mask[:,k])
                 location_loss, action_type_loss, color_loss = self.compute_valid_loss(location_logits, action_type_logits, color_logits, location_label, action_type_label, color_label, self.CELoss)
                 location_pred, action_type_pred, color_pred = torch.argmax(location_logits, dim=-1), torch.argmax(action_type_logits, dim=-1), torch.argmax(color_logits, dim=-1)
-                
                 total_location_loss += location_loss
                 total_action_type_loss += action_type_loss
                 total_color_loss += color_loss
@@ -200,9 +205,13 @@ class ActionDecoder(nn.Module):
             return (total_location_loss, total_action_type_loss, total_color_loss), (total_action_type_correct, total_location, total_location_correct, total_color, total_color_correct), (location_pred, action_type_pred, color_pred)
    
     def compute_loss(self, location_logits, action_type_logits, color_logits, location_label, action_type_label, color_label, loss_fn):
+        #print(f"location_min:{location_label[action_type_label!=2].min()}, location_max:{location_label[action_type_label!=2].max()} ")
+        #print(f"action_min:{action_type_label.min()}, action_max:{action_type_label.max()}")
+        #print(f"color_min:{color_label[action_type_label==0].min()}, color_max:{color_label[action_type_label==0].max()}")
         location_loss = loss_fn(location_logits[action_type_label!=2], location_label[action_type_label!=2])
         action_type_loss = loss_fn(action_type_logits, action_type_label)
         color_loss = loss_fn(color_logits[action_type_label==0], color_label[action_type_label==0])
+
         return location_loss, action_type_loss, color_loss
 
     def compute_valid_loss(self, location_logits, action_type_logits, color_logits, location_label, action_type_label, color_label, loss_fn):

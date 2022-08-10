@@ -1,7 +1,9 @@
 import torch, sys, torch.nn as nn, re
+from tqdm import tqdm
 sys.path.append('..')
 from utils import *
 from builder.diff import is_feasible_next_placement
+import pdb
 
 def is_feasible_action(built_config_post_last_action, new_action_label):
 	# new_action_label in 0-7624
@@ -80,7 +82,7 @@ class ActionSeq:
 			raise ValueError("length of indexes and scores should be the same")
 		self.decoder_hidden = decoder_hidden
 		self.last_idx = last_idx
-		self.seq_idxes =  seq_idxes
+		self.seq_idxes = seq_idxes
 		self.seq_scores = seq_scores
 		self.built_config_post_last_action = built_config_post_last_action
 		self.action_history_post_last_action = action_history_post_last_action
@@ -97,31 +99,47 @@ class ActionSeq:
 		# NOTE: No need to length normalize when making selection for beam. Only needed during final selection.
 		return sum(self.seq_scores) / len(self.seq_scores) # NOTE: works without rounding error because these are float tensors
 
-	def addTopk(self, topi, topv, decoder_hidden, beam_size, EOS_tokens):
+	def addTopk(self, location_logits, action_type_logits, color_logits, decoder_hidden, beam_size, EOS_tokens):
+		#if action_type_pred >= 2: break
+		normed_location_logits = torch.nn.functional.log_softmax(location_logits)
+		normed_action_type_logits = torch.nn.functional.log_softmax(action_type_logits)
+		normed_color_logits = torch.nn.functional.log_softmax(color_logits)
+
+		location_topv, location_topi = normed_location_logits.topk(beam_size)
+		action_type_topv, action_type_topi = normed_action_type_logits.topk(min([beam_size, 3]))
+		colors_topv, colors_topi = normed_color_logits.topk(min([beam_size, 6]))
+
+		items = torch.cartesian_prod(location_topi, action_type_topi, colors_topi)
+		log_probs = torch.sum(torch.torch.cartesian_prod(location_topv, action_type_topv, colors_topv), dim=1)
+		log_probs_ordered, log_probs_indices_ordered = torch.sort(log_probs, descending=True)
+		ordered_items = torch.index_select(items, 0, log_probs_indices_ordered)
+
 		terminates, seqs = [], []
 		for i in range(beam_size):
+			location_pred, action_type_pred, color_pred = ordered_items[i, 0], ordered_items[i, 1], ordered_items[i, 2]
+			scalar_label = convert_to_scalar_label((location_pred, action_type_pred, color_pred ))
 			idxes = self.seq_idxes[:] # pass by value
 			scores = self.seq_scores[:] # pass by value
 
-			idxes.append(topi[0][i])
-			scores.append(topv[0][i])
+			idxes.append(scalar_label)
+			scores.append(log_probs[i])
 
-			is_feasible = is_feasible_action(self.built_config_post_last_action, topi[0][i].item())
+			is_feasible = is_feasible_action(self.built_config_post_last_action, scalar_label)
 			action_feasibilities = self.action_feasibilities[:] # pass by value
 			action_feasibilities.append(is_feasible) # TODO: don't recompute feasibility in following code
 
-			built_config_post_last_action = update_built_config(self.built_config_post_last_action, topi[0][i].item())
-			action_history_post_last_action = update_action_history(self.action_history_post_last_action, topi[0][i].item(), self.built_config_post_last_action)
+			built_config_post_last_action = update_built_config(self.built_config_post_last_action, scalar_label)
+			action_history_post_last_action = update_action_history(self.action_history_post_last_action, scalar_label, self.built_config_post_last_action)
 
 			seq = ActionSeq(
-				decoder_hidden=decoder_hidden, last_idx=topi[0][i], built_config_post_last_action=built_config_post_last_action,
+				decoder_hidden=decoder_hidden, last_idx=scalar_label, built_config_post_last_action=built_config_post_last_action,
 				action_history_post_last_action=action_history_post_last_action, seq_idxes=idxes, seq_scores=scores,
 				action_feasibilities=action_feasibilities
 			)
 
-			if topi[0][i] in EOS_tokens:
+			if scalar_label in EOS_tokens:
 				terminates.append((
-					[idx.item() for idx in seq.seq_idxes], # TODO: need the eos token?
+					[scalar_label for idx in seq.seq_idxes], # TODO: need the eos token?
 					seq.likelihoodScore(),
 					seq.action_feasibilities,
 					seq.built_config_post_last_action
@@ -134,8 +152,9 @@ class ActionSeq:
 def beam_decode_action_seq(model, raw_inputs, encoder_inputs, labels, location_mask,
     beam_size, max_length, testdataset, num_top_seqs,
 	initial_grid_repr_input):
-
+	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 	terminal_seqs, prev_top_seqs, next_top_seqs = [], [], []
+
 	prev_top_seqs.append(
 		ActionSeq(
 			decoder_hidden=None, last_idx=torch.tensor(-1), # start token assigned action id of -1
@@ -149,9 +168,8 @@ def beam_decode_action_seq(model, raw_inputs, encoder_inputs, labels, location_m
 		for seq in prev_top_seqs:
 			# never stop action here -- .get is actually not needed
 			# print(seq.last_idx)
-			action_repr_input = action_label2action_repr(seq.last_idx.item()).view(1, 1, -1) # NOTE: should be [1, 1, x]
+			action_repr_input = action_label2action_repr(seq.last_idx).view(1, -1) # NOTE: should be [1, 1, x]
 			# print(action_repr_input.shape)
-
 			grid_repr_input = testdataset.get_repr(
 	            BuilderActionExample(
 	                action=None, # only ever used for computing output label which we don't need -- so None is okay
@@ -161,19 +179,28 @@ def beam_decode_action_seq(model, raw_inputs, encoder_inputs, labels, location_m
 	            ),
 	            raw_inputs.perspective_coords
 	        )[0].unsqueeze(0)
-			# print(grid_repr_input.shape)
-
 			# print(encoder_inputs.shape, grid_repr_input.shape, action_repr_input.shape, labels.shape, location_mask.shape)
-			loss, test_acc, test_predicted_seq = model(encoder_inputs.long().cuda(), grid_repr_input.cuda(), action_repr_input.squeeze(0).cuda(), labels.long().cuda(), location_mask.cuda(), raw_input=raw_inputs, dataset=testdataset)
+			location_logits, action_type_logits, color_logits = model.forward_one_step(
+				encoder_inputs.long().to(device),
+				grid_repr_input.to(device),
+				action_repr_input.to(device),
+				location_mask.to(device),
+				raw_input=raw_inputs,
+				dataset=testdataset)
+			#loss, test_acc, test_predicted_seq = model(encoder_inputs.long().to(device), grid_repr_input.to(device), action_repr_inputs.to(device), labels.long().to(device),location_mask.to(device), raw_input=raw_inputs,dataset=testdataset)
 			# decoder_output
 			# print(decoder_output.shape) # [1, 7624]
-
 			# m = nn.LogSoftmax()
 			# decoder_output = m(decoder_output)
-
-			# topv, topi = decoder_output.topk(beam_size) # topv : tensor([[-0.4913, -1.9879, -2.4969, -3.6227, -4.0751]])
-			topv, topi = torch.tensor([1]).view(1,1), torch.tensor([convert_to_scalar_label(test_predicted_seq)]).view(1,1)
-			term, top = seq.addTopk(topi, topv, None, beam_size, [torch.tensor(7*11*9*11)])
+			#topv, topi = decoder_output.topk(beam_size) # topv : tensor([[-0.4913, -1.9879, -2.4969, -3.6227, -4.0751]])
+			#test_predicted_seq = test_predicted_seq[0]
+			#topv, topi = torch.tensor([1]).view(1,1), torch.tensor([convert_to_scalar_label(test_predicted_seq)]).view(1,1)
+			term, top = seq.addTopk(location_logits.squeeze(),
+				action_type_logits.squeeze(),
+				color_logits.squeeze(),
+				None,
+				beam_size,
+				[torch.tensor(7*11*9*11)])
 			terminal_seqs.extend(term)
 			next_top_seqs.extend(top)
 
@@ -182,7 +209,7 @@ def beam_decode_action_seq(model, raw_inputs, encoder_inputs, labels, location_m
 		next_top_seqs = []
 
 	terminal_seqs += [
-		([idx.item() for idx in seq.seq_idxes], seq.likelihoodScore(), seq.action_feasibilities, seq.built_config_post_last_action) for seq in prev_top_seqs
+		([idx for idx in seq.seq_idxes], seq.likelihoodScore(), seq.action_feasibilities, seq.built_config_post_last_action) for seq in prev_top_seqs
 	]
 	terminal_seqs.sort(key=lambda x: x[1], reverse=True)
 
@@ -192,7 +219,7 @@ def beam_decode_action_seq(model, raw_inputs, encoder_inputs, labels, location_m
 		top_terminal_seqs = list(map(lambda x: (prune_seq(x[0], should_prune_seq(x[0])), prune_seq(x[2], should_prune_seq(x[0])), x[3]), terminal_seqs[:num_top_seqs]))
 	else:
 		top_terminal_seqs = list(map(lambda x: (prune_seq(x[0], should_prune_seq(x[0])), prune_seq(x[2], should_prune_seq(x[0])), x[3]), terminal_seqs))
-
+	print(top_terminal_seqs)
 	return top_terminal_seqs # terminal_seqs[0][0][:-1]
 
 def generate_action_pred_seq(model, test_item_batches, beam_size, max_length, testdataset):
@@ -203,11 +230,13 @@ def generate_action_pred_seq(model, test_item_batches, beam_size, max_length, te
 
 	try:
 		with torch.no_grad():
-			for i, data in enumerate(test_item_batches, 0):
+			for i, data in enumerate(tqdm(test_item_batches)):
 
 				# get the inputs; data is a list of [inputs, labels]
 				encoder_inputs, grid_repr_inputs, action_repr_inputs, labels, location_mask, raw_inputs = data
-				encoder_inputs, grid_repr_inputs, action_repr_inputs, labels, location_mask = encoder_inputs.unsqueeze(0), grid_repr_inputs.unsqueeze(0), action_repr_inputs.unsqueeze(0), labels.unsqueeze(0), location_mask.unsqueeze(0)
+				encoder_inputs, grid_repr_inputs, action_repr_inputs, labels, location_mask = encoder_inputs.unsqueeze(
+					0), grid_repr_inputs.unsqueeze(0), action_repr_inputs.unsqueeze(0), labels.unsqueeze(
+					0), location_mask.unsqueeze(0)
 				# print(encoder_inputs.shape, grid_repr_inputs.shape, action_repr_inputs.shape, labels.shape, location_mask.shape)
 				# loss, test_acc, test_predicted_seq = model(encoder_inputs.long().cuda(), grid_repr_inputs.cuda(), action_repr_inputs.cuda(), labels.long().cuda(), location_mask.cuda(), raw_input=raw_inputs, dataset=testdataset)
 				"""
@@ -219,12 +248,11 @@ def generate_action_pred_seq(model, test_item_batches, beam_size, max_length, te
 				"""
 				generated_seq = beam_decode_action_seq(model, raw_inputs, encoder_inputs, labels[:,0], location_mask[:,0],
 					beam_size, max_length, testdataset, 1,
-					initial_grid_repr_input=grid_repr_inputs[:,0]
+					initial_grid_repr_input=grid_repr_inputs[:,0].unsqueeze(0)
 				) # list of tuples -- [(seq, feas, end_built_configs)]
 
 				# list(map(lambda x: x[0], generated_seq))
 				# list(map(lambda x: x[1], generated_seq))
-
 				generated_seqs.append(
 					{
 						"generated_seq": list(map(lambda x: x[0], generated_seq)),
