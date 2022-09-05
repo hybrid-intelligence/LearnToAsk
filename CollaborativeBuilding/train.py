@@ -114,6 +114,7 @@ def main(args, config):
         json.dump(config, f)
 
     optimizer = optim.Adam(model.parameters(), lr=train_config["lr"], betas=(train_config["beta1"], train_config["beta2"]))
+    max_f1 = 0
 
     for epoch in range(train_config['num_epochs']):
         print("Training...")
@@ -150,16 +151,15 @@ def main(args, config):
             total_actions += len(labels)
 
         train_loss = train_loss / len(train_items)
-        
+
         print('Train | Loss: {}'.format(train_loss))
         print('Train | Location Acc: {}, Action Type Acc: {}, Color Acc: {}'.format(total_location_correct/total_location, total_action_type_correct/total_actions, total_color_correct/total_color))
-        f_output.write('Epoch {}\n'.format(epoch))  
+        f_output.write('Epoch {}\n'.format(epoch))
         f_output.write('Train | Loss: {}\n'.format(train_loss))
         f_output.write('Train | Location Acc: {}, Action Type Acc: {}, Color Acc: {}\n'.format(total_location_correct/total_actions, total_action_type_correct/total_actions, total_color_correct/total_color))
 
         model.eval()
         valid_loss = 0
-        max_f1 = 0
         valid_pred_seqs = []
         valid_raw_inputs = []
 
