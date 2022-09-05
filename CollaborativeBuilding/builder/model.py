@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from builder.dataloader_with_glove import BuilderDataset, RawInputs
-import pdb
 sys.path.append('..')
 from utils import *
 
@@ -27,7 +26,6 @@ class Builder(nn.Module):
 
     def forward(self, encoder_inputs, grid_repr_inputs, action_repr_inputs, label, location_mask=None, raw_input=None, dataset=None):
         dialogue_repr = self.encoder(encoder_inputs)
-        pdb.set_trace()
         loss, acc, predicted_seq = self.decoder(dialogue_repr, grid_repr_inputs, action_repr_inputs, label, location_mask, raw_input, dataset)
         return loss, acc, predicted_seq
 

@@ -2,7 +2,7 @@
   "seed": 0,
   "train_config": {
     "batch_size": 50,
-    "num_epochs": 50,
+    "num_epochs": 20,
     "warm_up_steps": 1,
     "warm_up_factor": 0.1,
     "beta1": 0.9,
